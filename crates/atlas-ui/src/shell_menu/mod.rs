@@ -37,6 +37,11 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_USER};
 /// Custom Win32 message: a request was queued; the worker should drain it.
 pub(crate) const WM_ATLAS_SHELLMENU: u32 = WM_USER + 0x0D1B;
 
+/// Command ID range passed to `IContextMenu::QueryContextMenu`.
+/// Shell extensions assign command IDs within [ID_FIRST, ID_LAST].
+pub const ID_FIRST: u32 = 1;
+pub const ID_LAST: u32 = 0x7FFF;
+
 /// A rasterised menu-item icon: straight (non-premultiplied) RGBA, row-major,
 /// `w * h * 4` bytes. Crosses the thread boundary as plain data; the UI wraps it
 /// in an `Arc<RenderImage>` on arrival.

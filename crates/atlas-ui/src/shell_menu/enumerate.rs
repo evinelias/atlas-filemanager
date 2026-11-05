@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MIIM_SUBMENU, WM_INITMENUPOPUP,
 };
 
-use super::{NativeItemKind, NativeMenuItem, RawIcon};
+use super::{NativeItemKind, NativeMenuItem, RawIcon, ID_FIRST, ID_LAST};
 
 /// Verbs that Atlas already provides in its own section; the native duplicates
 /// are dropped so the menu shows each action once.
@@ -43,11 +43,21 @@ fn trim_separators(items: &mut Vec<NativeMenuItem>) {
     }
 }
 
+/// Determine if a menu item represents a valid executable command within the registered ID range.
+pub(crate) fn is_valid_command(is_submenu: bool, wid: u32, id_first: u32, id_last: u32) -> bool {
+    !is_submenu && wid >= id_first && wid <= id_last
+}
+
 /// Walk `hmenu` into flat items. Submenus are always left lazy
 /// (`children: None`, filled on demand via `ExpandSubmenu`) so the initial build
 /// only enumerates the top level — no eager `WM_INITMENUPOPUP` round-trips to
 /// slow third-party handlers (Open with, Send to, 7-Zip).
-pub(crate) fn walk_menu(hmenu: HMENU, icm: &IContextMenu, id_first: u32) -> Vec<NativeMenuItem> {
+pub(crate) fn walk_menu(
+    hmenu: HMENU,
+    icm: &IContextMenu,
+    id_first: u32,
+    id_last: u32,
+) -> Vec<NativeMenuItem> {
     let mut out = Vec::new();
     unsafe {
         let count = GetMenuItemCount(Some(hmenu));
@@ -103,23 +113,35 @@ pub(crate) fn walk_menu(hmenu: HMENU, icm: &IContextMenu, id_first: u32) -> Vec<
                 continue;
             }
 
-            let item_id = info.wID.saturating_sub(id_first);
+            let is_submenu = !info.hSubMenu.is_invalid();
+
+            // Only query verbs and compute command offsets for real commands within
+            // [id_first, id_last]. Submenus and non-command items are not commands:
+            // for submenus, wID is an HMENU pointer/handle rather than a command ID.
+            // Passing a value >= 0xFFFF to GetCommandString causes shell32 to treat it
+            // as a string pointer (IS_INTRESOURCE fails), dereference it in StrCmpICW,
+            // and crash with an access violation (0xC0000005).
+            let (item_id, verb, kind) = if is_submenu {
+                let sub_id = if info.wID >= id_first {
+                    info.wID.saturating_sub(id_first)
+                } else {
+                    (info.hSubMenu.0 as usize as u32).saturating_sub(id_first)
+                };
+                (sub_id, None, NativeItemKind::Submenu { children: None })
+            } else if info.wID >= id_first && info.wID <= id_last {
+                let cmd_id = info.wID - id_first;
+                let verb = command_verb(icm, cmd_id);
+                if redundant_verb(verb.as_deref()) {
+                    continue;
+                }
+                (cmd_id, verb, NativeItemKind::Normal)
+            } else {
+                (info.wID, None, NativeItemKind::Normal)
+            };
+
             let disabled = (info.fState.0 & (MFS_DISABLED.0 | MFS_GRAYED.0)) != 0;
             let is_default = (info.fState.0 & MFS_DEFAULT.0) != 0;
-
-            // Canonical verb (best-effort; many shell items have none).
-            let verb = command_verb(icm, item_id);
-            if redundant_verb(verb.as_deref()) {
-                continue;
-            }
-
             let icon = bitmap_to_rgba(info.hbmpItem);
-
-            let kind = if !info.hSubMenu.is_invalid() {
-                NativeItemKind::Submenu { children: None }
-            } else {
-                NativeItemKind::Normal
-            };
 
             out.push(NativeMenuItem {
                 id: item_id,
@@ -165,6 +187,23 @@ mod tests {
         assert!(matches!(items[1].kind, NativeItemKind::Separator));
         assert!(matches!(items[2].kind, NativeItemKind::Normal));
     }
+    #[test]
+    fn submenu_items_never_have_redundant_verbs() {
+        assert!(!redundant_verb(None));
+    }
+
+    #[test]
+    fn test_valid_command_id() {
+        assert!(is_valid_command(false, 1, 1, 0x7FFF));
+        assert!(is_valid_command(false, 100, 1, 0x7FFF));
+        assert!(is_valid_command(false, 0x7FFF, 1, 0x7FFF));
+        // Submenus are never commands:
+        assert!(!is_valid_command(true, 100, 1, 0x7FFF));
+        assert!(!is_valid_command(true, 0x2A0775, 1, 0x7FFF));
+        // IDs outside range:
+        assert!(!is_valid_command(false, 0, 1, 0x7FFF));
+        assert!(!is_valid_command(false, 0x2A0775, 1, 0x7FFF));
+    }
 }
 
 /// Populate a submenu via the `WM_INITMENUPOPUP` its dynamic handler (Open with,
@@ -176,6 +215,7 @@ pub(crate) fn walk_submenu(
     icm2: Option<&IContextMenu2>,
     icm3: Option<&IContextMenu3>,
     id_first: u32,
+    id_last: u32,
 ) -> Vec<NativeMenuItem> {
     unsafe {
         let wparam = windows::Win32::Foundation::WPARAM(hsub.0 as usize);
@@ -187,11 +227,20 @@ pub(crate) fn walk_submenu(
             let _ = icm2.HandleMenuMsg(WM_INITMENUPOPUP, wparam, lparam);
         }
     }
-    walk_menu(hsub, icm, id_first)
+    walk_menu(hsub, icm, id_first, id_last)
 }
 
 /// `GetCommandString(GCS_VERBW)`; `None` on the (common) failure path.
 unsafe fn command_verb(icm: &IContextMenu, item_id: u32) -> Option<String> {
+    // Defense-in-depth:
+    // The Windows IS_INTRESOURCE check treats any idCmd >= 0xFFFF as an LPCWSTR/LPCSTR string pointer.
+    // Passing a non-pointer >= 0xFFFF causes shell32 (or shell extensions) to call StrCmpICW on an invalid
+    // pointer, triggering an access violation (0xC0000005). Valid command offsets from ID_FIRST..=ID_LAST
+    // never exceed 0x7FFF.
+    if item_id >= 0x7FFF {
+        return None;
+    }
+
     let mut buf = [0u16; 64];
     let r = icm.GetCommandString(
         item_id as usize,

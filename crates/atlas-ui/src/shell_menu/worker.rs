@@ -37,7 +37,9 @@ const CMIC_MASK_UNICODE: u32 = 0x0000_4000;
 const CMIC_MASK_PTINVOKE: u32 = 0x2000_0000;
 
 use super::enumerate::walk_menu;
-use super::{NativeMenuItem, ShellMenuEvent, ShellMenuRequest, WM_ATLAS_SHELLMENU};
+use super::{
+    NativeMenuItem, ShellMenuEvent, ShellMenuRequest, ID_FIRST, ID_LAST, WM_ATLAS_SHELLMENU,
+};
 
 /// The live shell context menu and its backing COM objects. `Drop` frees the
 /// HMENU; the `IContextMenu*` are released by their own refcounts.
@@ -274,15 +276,13 @@ unsafe fn build_menu(
 
     use windows::Win32::UI::WindowsAndMessaging::CreatePopupMenu;
     let hmenu = CreatePopupMenu().ok()?;
-    const ID_FIRST: u32 = 1;
-    const ID_LAST: u32 = 0x7FFF;
     let hr = icm.QueryContextMenu(hmenu, 0, ID_FIRST, ID_LAST, CMF_NORMAL);
     if hr.is_err() {
         let _ = DestroyMenu(hmenu);
         return None;
     }
 
-    let items = walk_menu(hmenu, &icm, ID_FIRST);
+    let items = walk_menu(hmenu, &icm, ID_FIRST, ID_LAST);
 
     Some((
         ActiveMenu {
@@ -373,6 +373,7 @@ unsafe fn expand_submenu(id: u64, item_id: u32) -> Vec<NativeMenuItem> {
             am.icm2.as_ref(),
             am.icm3.as_ref(),
             am.id_first,
+            ID_LAST,
         )
     })
 }
@@ -393,7 +394,8 @@ unsafe fn find_submenu(hmenu: HMENU, target_id: u32) -> Option<HMENU> {
             continue;
         }
         if !info.hSubMenu.is_invalid() {
-            if info.wID == target_id {
+            let submenu_handle = info.hSubMenu.0 as usize as u32;
+            if info.wID == target_id || submenu_handle == target_id {
                 return Some(info.hSubMenu);
             }
             if let Some(found) = find_submenu(info.hSubMenu, target_id) {
